@@ -1,7 +1,7 @@
 from __future__ import annotations
 import yaml
 from pathlib import Path
-from .types import JobSettings
+from .types_job_types import JobSettings
 
 
 DEFAULTS = {
@@ -19,6 +19,15 @@ DEFAULTS = {
 class Settings:
     def __init__(self, data: dict | None = None):
         self._data = {**DEFAULTS, **(data or {})}
+        
+    @property
+    def allowed_exts(self):
+        """Return a unified set of all allowed file extensions."""
+        return set(
+            self._data["allowed_images"]
+            + self._data["allowed_docs"]
+            + self._data["allowed_pdfs"]
+        )
 
     @classmethod
     def from_file(cls, path: Path) -> "Settings":

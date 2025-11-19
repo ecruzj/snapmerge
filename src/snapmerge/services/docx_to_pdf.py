@@ -72,14 +72,6 @@ def _export_to_pdf_with_word(inp: Path, out_pdf: Path) -> None:
 
         if not out_pdf.exists():
             raise DocxConversionError("Word no generó el PDF (sin excepción).")
-
-    # except com_error as e:  # type: ignore[name-defined]
-    #     desc = ""
-    #     try:
-    #         desc = e.excepinfo[2] if e.excepinfo and e.excepinfo[2] else ""
-    #     except Exception:
-    #         pass
-    #     raise DocxConversionError(f"Error COM Word 0x{e.hresult & 0xFFFFFFFF:08X}: {desc or e}")  # type: ignore[attr-defined]
     finally:
         if co_init:
             try:

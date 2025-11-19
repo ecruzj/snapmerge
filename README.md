@@ -12,3 +12,7 @@ Excel files are **not** supported in v1.
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt # or: pip install -e .[dev]
+
+## Run the App
+```bash
+python -m snapmerge.app_qt

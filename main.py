@@ -1,4 +1,4 @@
-from snapmerge.app_qt import main
+from snapmerge.main_app import main
 
 if __name__ == "__main__":
     main()

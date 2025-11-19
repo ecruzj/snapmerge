@@ -8,7 +8,7 @@
             "name": "Python Debugger: Module",
             "type": "debugpy",
             "request": "launch",
-            "module": "src.snapmerge.app_qt",
+            "module": "src.snapmerge.main_app",
             "justMyCode": true,
             "console": "externalTerminal"
         }
