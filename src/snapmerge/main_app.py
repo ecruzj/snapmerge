@@ -1,11 +1,13 @@
 from __future__ import annotations
+import html
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QIcon, QGuiApplication
 from PySide6.QtUiTools import loadUiType
 from PySide6.QtWidgets import (
@@ -23,6 +25,7 @@ from snapmerge.config import Settings
 from snapmerge.pipeline import run_merge
 from snapmerge.services.temp_utils import TempDir
 from snapmerge.services.docx_to_pdf import _patch_win32com_genpy_to_temp
+from snapmerge.merge_worker import MergeWorker, MergeJob
 
 # ---------------------------------------------------------------------------
 # Load .ui file
@@ -47,6 +50,14 @@ else:  # very old / edge Qt versions
 class SnapMergeApp(QtBaseClass):
     def __init__(self) -> None:
         super().__init__()
+        
+        # Log styles
+        self.LOG_STYLES = {
+            "warning": {"color": "#d97a00", "bold": True},
+            "error":   {"color": "#c62828", "bold": True},
+            "success": {"color": "#007200", "bold": True},
+            "info":    {"color": "#000000", "bold": False},
+        }
 
         # Build UI
         self.ui = Ui_SnapMergeWindow()
@@ -127,7 +138,7 @@ class SnapMergeApp(QtBaseClass):
         self.log("Ready to merge files.")
 
         # Load settings from YAML (or defaults if file is missing)
-        config_path = HERE.parent / "config.yaml"
+        config_path = HERE.parent.parent / "config.yaml"
         self.settings = Settings.from_file(config_path)
         
         # Cache extension groups from settings (all lowercase)
@@ -136,17 +147,35 @@ class SnapMergeApp(QtBaseClass):
         self.doc_exts = {ext.lower() for ext in self.settings.get("allowed_docs", [])}
         
         self.word_page_count_enabled = bool(self.settings.get("word_page_count", True))
+        self.max_docs_for_word_batch = int(self.settings.get("max_docs_for_word_batch", 30))
         
         # Cache for Word page counts to avoid reopening the same file
         self._doc_pages_cache: dict[Path, int] = {}
+        
+        self._merge_thread: QThread | None = None
+        self._merge_worker: MergeWorker | None = None
+        self._current_staging_dir: Path | None = None
+        self._last_output_pdf: Path | None = None
+
 
     # ------------------------------------------------------------------
     # Helpers
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------    
+    def log(self, message: str, style: str = "info") -> None:
+        """Unified logger with style presets (warning, error, success, info)."""
+        safe = html.escape(message)  # Avoid breaking HTML due to special characters
 
-    def log(self, message: str) -> None:
-        """Append a line to the log text box."""
-        self.ui.log_text.append(message)
+        cfg = self.LOG_STYLES.get(style, self.LOG_STYLES["info"])
+        color = cfg["color"]
+        bold = cfg["bold"]
+
+        if bold:
+            html_msg = f'<span style="color:{color};"><b>{safe}</b></span>'
+        else:
+            html_msg = f'<span style="color:{color};">{safe}</span>'
+
+        self.ui.log_text.append(html_msg)
+
         
     def _set_ui_enabled(self, enabled: bool) -> None:
         """
@@ -174,7 +203,6 @@ class SnapMergeApp(QtBaseClass):
 
         # Merge / Cancel buttons
         self.ui.run_btn.setEnabled(enabled)
-        self.ui.cancel_btn.setEnabled(enabled)
 
     # -------------------- File list handling -------------------------
 
@@ -189,20 +217,57 @@ class SnapMergeApp(QtBaseClass):
             p for p in candidates if p.is_file() and p.suffix.lower() in self.settings.allowed_exts
         ]
         return paths
-
+    
     def _append_files(self, paths: List[Path]) -> None:
-        """Append the given file paths to the table, skipping duplicates already present."""
+        """
+        Append the given file paths to the table, skipping duplicates.
+
+        Now consider two types of duplicates:
+        - Same Path
+        - Same signature (Name, Type, Size, Pages) even if the Path is different.
+        - Same signature (Name, Type, Size) only for .doc/.docx (ignoring Pages).
+        """
         if not paths:
             return
 
-        # Existing routes already present in the table
-        existing = set()
-        doc_candidates: list[Path] = [] # for doc page count update later
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 5)  # Path column
-            if item is not None:
-                existing.add(Path(item.text()).resolve())
+        # ------------------------------------------------------------------
+        # 1) Build sets from what already exists in the table
+        # ------------------------------------------------------------------
+        existing_paths: set[Path] = set()
+        existing_signatures: set[tuple[str, str, str, str]] = set()
+        doc_candidates: list[Path] = []  # for doc page count update later
 
+        for row in range(self.table.rowCount()):
+            # actual Path actual
+            path_item = self.table.item(row, 5)  # Path column
+            if path_item is not None:
+                try:
+                    rp = Path(path_item.text()).resolve()
+                    existing_paths.add(rp)
+                except Exception:
+                    pass
+
+            # actual signature (Name, Type, Size, Pages)
+            name_item = self.table.item(row, 1)
+            type_item = self.table.item(row, 2)
+            size_item = self.table.item(row, 3)
+            pages_item = self.table.item(row, 4)
+           
+            name_text = (name_item.text() if name_item else "").lower()
+            ext_text = (type_item.text() if type_item else "").lower()
+            size_text = size_item.text() if size_item else ""
+            pages_text = pages_item.text() if pages_item else ""
+            
+            if ext_text in ("doc", "docx"):
+                signature = (name_text, ext_text, size_text) # Create special signature for doc/docx (ignore pages)
+            else:
+                signature = (name_text, ext_text, size_text, pages_text) # Full signature for others
+                
+            existing_signatures.add(signature)
+
+        # ------------------------------------------------------------------
+        # 2) Process new paths
+        # ------------------------------------------------------------------
         added_count = 0
         skipped_count = 0
 
@@ -211,11 +276,69 @@ class SnapMergeApp(QtBaseClass):
                 continue
 
             rp = path.resolve()
-            if rp in existing:
-                skipped_count += 1
-                continue  # already in the table
 
-            existing.add(rp)  # mark as seen globally
+            # File data that we will use both for signing and for displaying
+            ext = path.suffix.lower().lstrip(".")
+            
+            if "." + ext in self.pdf_exts:
+                try:
+                    from PyPDF2 import PdfReader
+                    reader = PdfReader(str(rp))
+
+                    # Some versions use .is_encrypted, others .encrypted
+                    if getattr(reader, "is_encrypted", False):
+                        skipped_count += 1
+                        self.log(
+                            f"Skipped password-protected PDF (cannot be merged): {rp}",
+                            "error"
+                        )
+                        continue
+                except Exception as exc:
+                    # A PDF that can't even be opened; it's best not to accept it.
+                    skipped_count += 1
+                    self.log(
+                        f"Skipped unreadable PDF (cannot be merged): {rp} ({exc})",
+                        "error"
+                    )
+                    continue
+
+            try:
+                size_bytes = path.stat().st_size
+            except OSError:
+                size_bytes = 0
+            size_str = self._format_size(size_bytes)
+
+            pages = self._guess_pages(path)
+            pages_text = "" if pages is None else str(pages)
+
+            if "." + ext in self.doc_exts:
+                signature = (path.name.lower(), ext.lower(), size_str)
+            else:
+                # signature (Name, Type, Size, Pages)
+                signature = (path.name.lower(), ext.lower(), size_str, pages_text)
+
+            # 2.1 Duplicated by PATH
+            if rp in existing_paths:
+                skipped_count += 1
+                self.log(
+                    f"Skipped duplicate file (same path already in the list): {rp}",
+                    "warning")
+                continue
+
+            # 2.2 Duplicate by Name/Type/Size/Pages (even though the path is different)
+            if signature in existing_signatures:
+                skipped_count += 1
+                self.log(
+                    "Skipped duplicate file "
+                    "(same Name/Type/Size/Pages as another entry): "
+                    f"{path.name} [{ext}, {size_str}, pages={pages_text or '0'}]",
+                    "warning"
+                )
+                continue
+
+            # If we get here, it's a new file → we add it
+            existing_paths.add(rp)
+            existing_signatures.add(signature)
             added_count += 1
 
             row = self.table.rowCount()
@@ -231,26 +354,19 @@ class SnapMergeApp(QtBaseClass):
             self.table.setItem(row, 1, name_item)
 
             # Column 2: Type (extension)
-            ext = path.suffix.lower().lstrip(".")
             type_item = QTableWidgetItem(ext)
             self.table.setItem(row, 2, type_item)
 
-            # Column 3: Size
-            try:
-                size_bytes = path.stat().st_size
-            except OSError:
-                size_bytes = 0
-            size_item = QTableWidgetItem(self._format_size(size_bytes))
+            # Column 3: Size (ya calculado)
+            size_item = QTableWidgetItem(size_str)
             size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table.setItem(row, 3, size_item)
 
-            # Column 4: Pages only for images/pdfs
-            pages = self._guess_pages(path)
-            pages_text = "" if pages is None else str(pages)
+            # Column 4: Pages
             pages_item = QTableWidgetItem(pages_text)
             pages_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 4, pages_item)
-            
+
             # Collect doc/docx candidates for later page count update
             if "." + ext in self.doc_exts:
                 doc_candidates.append(rp)
@@ -259,17 +375,20 @@ class SnapMergeApp(QtBaseClass):
             path_item = QTableWidgetItem(str(rp))
             self.table.setItem(row, 5, path_item)
 
+        # ------------------------------------------------------------------
+        # 3) Post-processing: renumber, recalculate pages, doc pages
+        # ------------------------------------------------------------------
         self._renumber_rows()
         self._recalculate_total_pages()
-        
-        # Resolve doc pages in batch
+
+        # Resolve doc/docx pages in batch
         if doc_candidates:
             self._update_doc_pages_batch(doc_candidates)
 
         if added_count:
             self.log(f"Added {added_count} file(s).")
         if skipped_count:
-            self.log(f"Skipped {skipped_count} duplicate file(s).")
+            self.log(f"Skipped {skipped_count} duplicate file(s).", "warning")
 
     @staticmethod
     def _format_size(num_bytes: int) -> str:
@@ -331,6 +450,18 @@ class SnapMergeApp(QtBaseClass):
 
         if not to_process:
             return
+        
+        # If there are too many documents, we don't count pages to prevent the UI from freezing.
+        if len(to_process) > self.max_docs_for_word_batch:
+            self.log(
+                f"Skipping Word page counting for {len(to_process)} document(s) "
+                f"(limit {self.max_docs_for_word_batch}) to keep the app responsive.",
+                "warning",
+            )
+            return
+
+        # Give the UI a break before starting with COM/Word
+        QApplication.processEvents()
         
         # --- Loading dialog ---
         progress = QProgressDialog(
@@ -568,6 +699,151 @@ class SnapMergeApp(QtBaseClass):
                 self.table.setItem(row, 0, item)
             item.setText(str(row + 1))
 
+
+    # -------------------- Background merge via QThread -----------------
+    def _start_merge_job(self, job: MergeJob) -> None:
+        """Create QThread + MergeWorker and start the background merge."""
+        # Safety: avoid starting if another thread is already running
+        if self._merge_thread is not None and self._merge_thread.isRunning():
+            self.log("A merge is already running; new request ignored.")
+            return
+
+        self._merge_thread = QThread(self)
+        self._merge_worker = MergeWorker(job)
+        self._merge_worker.moveToThread(self._merge_thread)
+
+        # Wire thread/worker life‑cycle
+        self._merge_thread.started.connect(self._merge_worker.run)
+        self._merge_worker.finished.connect(self._on_merge_finished)
+        self._merge_worker.error.connect(self._on_merge_error)
+        
+        # Cancellation signals
+        self._merge_worker.cancelled.connect(self._on_merge_cancelled)
+        self._merge_worker.cancelled.connect(self._merge_thread.quit)
+        self._merge_worker.cancelled.connect(self._merge_worker.deleteLater)
+
+        # Progress / status signals
+        self._merge_worker.status.connect(self._on_worker_status)
+        self._merge_worker.progress.connect(self._on_worker_progress)
+        self._merge_worker.merge_start.connect(self._on_worker_merge_start)
+        self._merge_worker.merge_progress.connect(self._on_worker_merge_progress)
+
+        # Clean‑up when the job ends (success or error)
+        self._merge_worker.finished.connect(self._merge_thread.quit)
+        self._merge_worker.error.connect(self._merge_thread.quit)
+        self._merge_worker.finished.connect(self._merge_worker.deleteLater)
+        self._merge_worker.error.connect(self._merge_worker.deleteLater)
+        self._merge_thread.finished.connect(self._on_thread_finished)
+        self._merge_thread.finished.connect(self._merge_thread.deleteLater)
+
+        self._merge_thread.start()
+
+    def _cleanup_staging_dir(self) -> None:
+        """Delete the temporary staging directory, if any."""
+        if self._current_staging_dir is not None:
+            try:
+                shutil.rmtree(self._current_staging_dir, ignore_errors=True)
+            except Exception:
+                # Best‑effort clean‑up; don't crash the app on failure
+                pass
+            finally:
+                self._current_staging_dir = None
+
+    # -- slots that receive progress from MergeWorker (GUI thread) -----
+
+    def _on_worker_status(self, message: str) -> None:
+        self.log(message)
+
+    def _on_worker_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = int(done * 100 / total)
+        # Conversion phase → 0–70 %
+        bar_pct = int(pct * 0.7)
+        self.ui.merge_progress_bar.setValue(bar_pct)
+
+    def _on_worker_merge_start(self, total_files: int) -> None:
+        self.log(f"Merge phase started… {total_files} file(s) to append.")
+
+    def _on_worker_merge_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            return
+        if done == 1 or done == total or done % 10 == 0:
+            pct = int(done * 100 / total)
+            # Merge phase → 70–100 %
+            bar_pct = 70 + int(pct * 0.3)
+            self.ui.merge_progress_bar.setValue(bar_pct)
+            self.log(f"Merge progress: {done}/{total} ({pct}%)")
+
+    def _on_merge_finished(self, report: dict) -> None:
+        """Called when MergeWorker finishes successfully."""
+        self.ui.merge_progress_bar.setValue(100)
+        self._set_ui_enabled(True)
+        self.log("Merge completed successfully.", "success")
+        self._cleanup_staging_dir()
+
+        # Prefer the path reported by the pipeline, fallback to the last
+        # one selected in the UI if not present.
+        output_value = report.get("output") if isinstance(report, dict) else None
+        output_path = None
+        if output_value:
+            try:
+                output_path = Path(output_value)
+            except TypeError:
+                output_path = None
+        if output_path is None:
+            output_path = self._last_output_pdf
+
+        if output_path is None:
+            QMessageBox.information(
+                self,
+                "SnapMerge",
+                "The merge has finished successfully.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "SnapMerge",
+                "The merge has finished successfully.\n\n"
+                f"Output:\n{output_path}",
+            )
+
+    def _on_merge_error(self, message: str, tb: str) -> None:
+        """Called when MergeWorker emits an error."""
+        self._set_ui_enabled(True)
+        self.ui.merge_progress_bar.setVisible(False)
+        self._cleanup_staging_dir()
+
+        self.log(f"Error during merge: {message}", "error")
+        if tb:
+            self.log(tb, "error")
+
+        QMessageBox.critical(
+            self,
+            "SnapMerge",
+            f"An error occurred while merging:\n{message}",
+        )
+        
+    def _on_merge_cancelled(self) -> None:
+        """Called when the worker reports that the job was cancelled."""
+        self.log("Merge cancelled by user.", "warning")
+
+        self._set_ui_enabled(True)
+        self.ui.merge_progress_bar.setVisible(False)
+
+        self._cleanup_staging_dir()
+
+        QMessageBox.information(
+            self,
+            "SnapMerge",
+            "The merge operation was cancelled.",
+        )
+
+    def _on_thread_finished(self) -> None:
+        """Reset thread/worker references when the QThread stops."""
+        self._merge_thread = None
+        self._merge_worker = None
+
     # -------------------- Drag & Drop Events -------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
         """Trigger when something enters the window with drag."""
@@ -617,7 +893,7 @@ class SnapMergeApp(QtBaseClass):
                 all_paths.append(p)
 
         if not all_paths:
-            self.log("Dropped items, but none matched supported formats.")
+            self.log("Dropped items, but none matched supported formats.", "warning")
             event.ignore()
             return
 
@@ -638,11 +914,11 @@ class SnapMergeApp(QtBaseClass):
                 seen_roots.add(r_resolved)
                 unique_roots.append(r_resolved)
 
-        # Add to table
-        self._append_files(unique_paths)
-
         # Logs
         self.log(f"Added {len(unique_paths)} file(s) from drag & drop.")
+        
+        # Add to table
+        self._append_files(unique_paths)
 
         if len(unique_roots) == 1:
             folder = unique_roots[0]
@@ -690,7 +966,7 @@ class SnapMergeApp(QtBaseClass):
         paths = self._collect_files_from_folder(folder_path, recursive)
 
         if not paths:
-            self.log("No supported files found in this folder (or subfolders).")
+            self.log("No supported files found in this folder (or subfolders).", "warning")
             QMessageBox.information(
                 self,
                 "SnapMerge",
@@ -779,12 +1055,14 @@ class SnapMergeApp(QtBaseClass):
             paths.append(Path(text))
         return paths
 
+
     def on_merge_clicked(self) -> None:
         """Called when user clicks the Merge button.
 
         This validates the inputs, stages the selected files into a
-        temporary folder in the same order as the table, and calls the
-        real merge pipeline (run_merge).
+        temporary folder in the same order as the table, and then
+        starts a background QThread (MergeWorker) so the UI stays
+        responsive while ``run_merge`` is executing.
         """
         if self.table.rowCount() == 0:
             QMessageBox.warning(
@@ -835,13 +1113,24 @@ class SnapMergeApp(QtBaseClass):
             )
             return
 
+        # If a merge is already running, don't start a new one.
+        if self._merge_thread is not None and self._merge_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "SnapMerge",
+                "A merge operation is already running.",
+            )
+            return
+
+        self._last_output_pdf = output_path
+
         self.log("Merge requested.")
         self.log(f"Destination: {output_path}")
         self.log("Files to merge (in order):")
         for p in paths:
             self.log(f"  - {p}")
-        
-        # Disable UI while merging
+
+        # Disable main UI while merging and show progress bar
         self._set_ui_enabled(False)
         self.ui.merge_progress_bar.setVisible(True)
         self.ui.merge_progress_bar.setValue(0)
@@ -849,117 +1138,83 @@ class SnapMergeApp(QtBaseClass):
         # Stage files into a temporary folder so that the pipeline can
         # work over a single input_dir while preserving the table order.
         try:
-            with TempDir() as tmp:
-                staging_dir = tmp.path
+            staging_dir = Path(tempfile.mkdtemp(prefix="snapmerge_"))
+            staged_count = 0
 
-                staged_count = 0
-                for idx, src in enumerate(paths, start=1):
-                    if not src.exists():
-                        self.log(f"Skipping missing file: {src}")
-                        continue
+            for idx, src in enumerate(paths, start=1):
+                if not src.exists():
+                    self.log(f"Skipping missing file: {src}")
+                    continue
 
-                    # Prefix with numeric index so the pipeline, which
-                    # sorts by name, keeps the same order as the table.
-                    target_name = f"{idx:06d}_{src.name}"
-                    dst = staging_dir / target_name
-                    try:
-                        shutil.copy2(src, dst)
-                    except Exception as copy_exc:  # noqa: BLE001
-                        self.log(f"Error copying {src} → {dst}: {copy_exc}")
-                        continue
-                    staged_count += 1
+                target_name = f"{idx:06d}_{src.name}"
+                dst = staging_dir / target_name
+                try:
+                    shutil.copy2(src, dst)
+                except Exception as copy_exc:  # noqa: BLE001
+                    self.log(f"Error copying {src} → {dst}: {copy_exc}", "error")
+                    continue
+                staged_count += 1
 
-                if staged_count == 0:
-                    QMessageBox.warning(
-                        self,
-                        "SnapMerge",
-                        "No files could be staged for merging.\n"
-                        "Please check that the source files still exist.",
-                    )
-                    return
-
-                self.log(f"Staged {staged_count} file(s) for merge.")
-
-                # Callbacks to feed pipeline progress back into the log
-                def progress_cb(done: int, total: int) -> None:
-                    if total <= 0:
-                        return
-                    pct = int(done * 100 / total)
-                    # Conversion phase → 0–70 %
-                    bar_pct = int(pct * 0.7)
-                    self.ui.merge_progress_bar.setValue(bar_pct)
-                    self.log(f"Conversion: {done}/{total} ({pct}%)")
-                    QApplication.processEvents()
-
-                def status_cb(message: str) -> None:
-                    self.log(message)
-
-                def merge_start_cb(total_files: int) -> None:
-                    self.log(f"Merge phase started… {total_files} file(s) to append.")
-
-                def merge_progress_cb(done: int, total: int) -> None:
-                    if total <= 0:
-                        return
-                    # Log first, last and every 10th step to avoid noisy logs
-                    if done == 1 or done == total or done % 10 == 0:
-                        pct = int(done * 100 / total)
-                        # Merge phase → 70–100 %
-                        bar_pct = 70 + int(pct * 0.3)
-                        self.ui.merge_progress_bar.setValue(bar_pct)
-                        if done == 1 or done == total or done % 10 == 0:
-                            self.log(f"Merge progress: {done}/{total} ({pct}%)")
-                        QApplication.processEvents()
-                        
-                self.ui.merge_progress_bar.setVisible(True)
-                self.ui.merge_progress_bar.setValue(0)
-
-                # Run the real pipeline synchronously
-                report = run_merge(
-                    input_dir=staging_dir,
-                    output_pdf=output_path,
-                    settings=self.settings,
-                    progress_cb=progress_cb,
-                    status_cb=status_cb,
-                    merge_start_cb=merge_start_cb,
-                    merge_progress_cb=merge_progress_cb,
-                    log_file=None,
+            if staged_count == 0:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                QMessageBox.warning(
+                    self,
+                    "SnapMerge",
+                    "No files could be staged for merging.\n"
+                    "Please check that the source files still exist.",
                 )
+                self._set_ui_enabled(True)
+                self.ui.merge_progress_bar.setVisible(False)
+                return
+
+            self.log(f"Staged {staged_count} file(s) for merge.")
+            self._current_staging_dir = staging_dir
+
+            job = MergeJob(
+                input_dir=staging_dir,
+                output_pdf=output_path,
+                settings=self.settings,
+                log_file=None,
+            )
+            self._start_merge_job(job)
 
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Error during merge: {exc}")
+            if 'staging_dir' in locals():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            self._set_ui_enabled(True)
+            self.ui.merge_progress_bar.setVisible(False)
+            self.log(f"Error preparing merge: {exc}")
             QMessageBox.critical(
                 self,
                 "SnapMerge",
-                f"An error occurred while merging:\n{exc}",
+                f"An error occurred while preparing the merge:\n{exc}",
             )
-            return
-        finally:
-            self.ui.merge_progress_bar.setValue(100)   
-            self._set_ui_enabled(True) # re-enable UI
-
-        # If we reach here, the merge is done.
-        self.log("Merge completed successfully.")
-        QMessageBox.information(
-            self,
-            "SnapMerge",
-            "The merge has finished successfully.\n\n"
-            f"Output:\n{report.get('output', output_path)}",
-        )
 
     def on_cancel_clicked(self) -> None:
-        # No background job yet; just log for now.
-        self.log("Cancel clicked (no running job).")
+        """Called when user clicks Cancel."""
+        if self._merge_thread is not None and self._merge_thread.isRunning():
+            # request confirmation
+            reply = QMessageBox.question(
+                self,
+                "Cancel merge?",
+                "Do you really want to cancel the merge process?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
+            self.log("Cancellation requested...", "warning")
+
+            if self._merge_worker is not None:
+                self._merge_worker.request_cancel()
+            return
+
+        # there is no running job
+        self.log("Cancel clicked (no running job).")
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-# def main() -> None:
-#     app = QApplication(sys.argv)
-#     window = SnapMergeApp()
-#     window.show()
-#     sys.exit(app.exec())
-
 def main():
     import sys
     import traceback
