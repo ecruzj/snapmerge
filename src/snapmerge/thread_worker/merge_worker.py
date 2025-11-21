@@ -13,8 +13,8 @@ from typing import Optional, Dict, Any
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from .config import Settings
-from .pipeline import run_merge
+from ..config import Settings
+from ..pipeline import run_merge
 
 class MergeCancelledError(Exception):
     """Raised when the user requests cancellation of the merge job."""

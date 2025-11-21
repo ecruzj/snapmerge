@@ -14,6 +14,7 @@ DEFAULTS = {
     "allowed_pdfs": [".pdf"],
     "max_image_dim_px": 4000,
     "workers": 4,
+    "word_page_count": True
     }
 
 class Settings:
@@ -46,6 +47,7 @@ class Settings:
         image_margin_pts=int(self._data["image_margin_pts"]),
         max_image_dim_px=int(self._data["max_image_dim_px"]),
         workers=int(self._data["workers"]),
+        word_page_count=bool(self._data["word_page_count"]),
         )
 
     def get(self, key: str, default=None):

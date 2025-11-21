@@ -1,6 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Callable, Iterable, List, Dict, Any
+from typing import Callable, Iterable
+
+from snapmerge.services.file_names import get_original_file_name
 from .config import Settings
 from .logging_setup import get_logger
 from .types_job_types import JobSettings
@@ -54,13 +56,13 @@ def _run_core_from_files(
     merge_start_cb: Callable[[int], None] | None = None,
     merge_progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Procesa una lista de archivos ya descubiertos y ordenados.
+    """Processes a list of already discovered and sorted files.
 
-    Esta función contiene TODA la lógica de:
-    - convertir imágenes/docx a PDF
-    - acumular PDFs a mergear
-    - invocar merge_pdfs
-    - construir el reporte final
+    This function contains ALL the logic for:
+    - converting images/docx to PDF
+    - accumulating PDFs to merge
+    - invoking merge_pdfs
+    - building the final report
     """
 
     allowed_pdfs = settings.get("allowed_pdfs") or []
@@ -80,7 +82,8 @@ def _run_core_from_files(
     with TempDir() as tmp:
         for idx, f in enumerate(files, start=1):
             if status_cb:
-                status_cb(f"Processing ({idx}/{total}): {f.name}")
+                original_name = get_original_file_name(f.name)
+                status_cb(f"Processing ({idx}/{total}): {original_name}")
 
             ext = f.suffix.lower()
             try:
@@ -96,7 +99,7 @@ def _run_core_from_files(
                 elif ext in allowed_docs:
                     outp = tmp.path / (f.stem + ".pdf")
                     if status_cb:
-                        status_cb(f"Converting Word → PDF: {f.name}")
+                        status_cb(f"Converting Word → PDF: {original_name}")
                     ok = docx_to_pdf(f, outp)
                     if ok and outp.exists():
                         converted.append(outp)
@@ -105,7 +108,7 @@ def _run_core_from_files(
                             status_cb(f"Converted: {outp.name}")
                     else:
                         if status_cb:
-                            status_cb(f"Can't Convert {f.name} to PDF")
+                            status_cb(f"Can't Convert {original_name} to PDF")
                         logger.warning("Word not available or output missing. Skipping %s", f)
                         skipped.append(f)
                 else:
@@ -161,16 +164,16 @@ def run_manual_merge(
     log_file: Path | None = None,
 ) -> dict:
     """
-    Ejecuta el merge usando una lista explícita de archivos (orden YA definido),
-    ideal para el nuevo UI de SnapMerge.
+    Perform the merge using an explicit file list (already defined order),
+    ideal for SnapMerge's new UI.
     """
     logger = get_logger(logfile=log_file)
 
-    # Convertimos a lista de Paths (por si vienen strings)
+    # convert to a list of Paths (in case strings are involved)
     file_list = [Path(f) for f in files]
 
-    # El input_dir aquí es solo informativo (para el reporte/logs).
-    # Puedes usar Path.cwd() o el padre del primer archivo.
+    # The input_dir here is for informational purposes only (for reporting/logs).
+    # You can use Path.cwd() or the parent of the first file.
     base_dir = file_list[0].parent if file_list else Path.cwd()
     job: JobSettings = settings.as_job(base_dir, output_pdf)
 
