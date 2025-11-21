@@ -39,6 +39,13 @@
        </widget>
       </item>
       <item>
+       <widget class="QCheckBox" name="allow_duplicate_files_chk">
+        <property name="text">
+         <string>Allow Duplicate Files</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QPushButton" name="remove_btn">
         <property name="text">
          <string>Remove</string>

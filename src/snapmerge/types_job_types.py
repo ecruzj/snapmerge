@@ -14,3 +14,4 @@ class JobSettings:
     image_margin_pts: int
     max_image_dim_px: int
     workers: int
+    word_page_count: bool

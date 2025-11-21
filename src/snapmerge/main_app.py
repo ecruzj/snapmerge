@@ -1,6 +1,5 @@
 from __future__ import annotations
 import html
-import os
 import shutil
 import sys
 import tempfile
@@ -8,7 +7,7 @@ from pathlib import Path
 from typing import List
 
 from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QIcon, QGuiApplication
+from PySide6.QtGui import QIcon
 from PySide6.QtUiTools import loadUiType
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,15 +16,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTableWidgetItem,
     QAbstractItemView,
-    QHeaderView,
-    QProgressDialog
+    QHeaderView
 )
 
 from snapmerge.config import Settings
-from snapmerge.pipeline import run_merge
-from snapmerge.services.temp_utils import TempDir
-from snapmerge.services.docx_to_pdf import _patch_win32com_genpy_to_temp
-from snapmerge.merge_worker import MergeWorker, MergeJob
+# from snapmerge.services.docx_to_pdf import _patch_win32com_genpy_to_temp
+from snapmerge.thread_worker.doc_pages_worker import DocPagesWorker
+from snapmerge.thread_worker.merge_worker import MergeWorker, MergeJob
 
 # ---------------------------------------------------------------------------
 # Load .ui file
@@ -156,7 +153,8 @@ class SnapMergeApp(QtBaseClass):
         self._merge_worker: MergeWorker | None = None
         self._current_staging_dir: Path | None = None
         self._last_output_pdf: Path | None = None
-
+        self._doc_thread: QThread | None = None
+        self._doc_worker: DocPagesWorker | None = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -192,6 +190,7 @@ class SnapMergeApp(QtBaseClass):
         self.ui.move_down_btn.setEnabled(enabled)
         self.ui.sort_name_btn.setEnabled(enabled)
         self.ui.sort_type_btn.setEnabled(enabled)
+        self.ui.allow_duplicate_files_chk.setEnabled(enabled)
 
         # Table
         self.table.setEnabled(enabled)
@@ -229,6 +228,11 @@ class SnapMergeApp(QtBaseClass):
         """
         if not paths:
             return
+        
+        # If the user checked "Overwrite if exists", we allow duplicates
+        # by signature (Name/Type/Size/Pages). We only continue to block exact duplicates
+        # by Path.
+        skip_signature_check = self.ui.allow_duplicate_files_chk.isChecked()
 
         # ------------------------------------------------------------------
         # 1) Build sets from what already exists in the table
@@ -326,7 +330,8 @@ class SnapMergeApp(QtBaseClass):
                 continue
 
             # 2.2 Duplicate by Name/Type/Size/Pages (even though the path is different)
-            if signature in existing_signatures:
+            # We only apply this validation if *Overwrite* is not checked.
+            if (not skip_signature_check) and (signature in existing_signatures):
                 skipped_count += 1
                 self.log(
                     "Skipped duplicate file "
@@ -432,8 +437,8 @@ class SnapMergeApp(QtBaseClass):
     
     def _update_doc_pages_batch(self, paths: list[Path]) -> None:
         """
-        Update page count for a batch of doc/docx files using a single
-        Word instance. Updates both the cache and the table column.
+        Launch a background worker to count doc/docx pages.
+        The UI doesn't freeze; the counts are populated when the worker finishes.
         """
         if not self.word_page_count_enabled:
             return
@@ -441,7 +446,7 @@ class SnapMergeApp(QtBaseClass):
         if sys.platform != "win32":
             return
 
-        # Normalize and filter only documents that are not cached
+        # Normalize and filter only documents that are NOT cached yet
         to_process: list[Path] = []
         for p in paths:
             p_res = p.resolve()
@@ -450,226 +455,54 @@ class SnapMergeApp(QtBaseClass):
 
         if not to_process:
             return
+
+        # (Optional) respect the document limit to avoid abuse
+        # if len(to_process) > self.max_docs_for_word_batch:
+        #     self.log(
+        #         f"Skipping Word page counting for {len(to_process)} document(s) "
+        #         f"(limit {self.max_docs_for_word_batch}); you can run it later.",
+        #         "warning",
+        #     )
+        #     return
+
+        self._start_doc_pages_job(to_process)
         
-        # If there are too many documents, we don't count pages to prevent the UI from freezing.
-        if len(to_process) > self.max_docs_for_word_batch:
+    def _start_doc_pages_job(self, paths: list[Path]) -> None:
+        # Avoid launching two page workers in parallel.
+        if self._doc_thread is not None and self._doc_thread.isRunning():
             self.log(
-                f"Skipping Word page counting for {len(to_process)} document(s) "
-                f"(limit {self.max_docs_for_word_batch}) to keep the app responsive.",
-                "warning",
+                "Word page counting is already running in background.",
+                "info",
             )
             return
 
-        # Give the UI a break before starting with COM/Word
-        QApplication.processEvents()
+        self._doc_thread = QThread(self)
+        self._doc_worker = DocPagesWorker(paths)
+        self._doc_worker.moveToThread(self._doc_thread)
+
+        # Connections
+        self._doc_thread.started.connect(self._doc_worker.run)
+        self._doc_worker.status.connect(self._on_doc_pages_status)
+        self._doc_worker.progress.connect(self._on_doc_pages_progress)
+        self._doc_worker.finished.connect(self._on_doc_pages_finished)
+        self._doc_worker.error.connect(self._on_doc_pages_error)
+
+        # Cleaning
+        self._doc_worker.finished.connect(self._doc_thread.quit)
+        self._doc_worker.finished.connect(self._doc_worker.deleteLater)
+        self._doc_thread.finished.connect(self._on_doc_thread_finished)
+        self._doc_thread.finished.connect(self._doc_thread.deleteLater)
+
+        # Show bar down by reusing the same
+        self.ui.merge_progress_bar.setVisible(True)
+        self.ui.merge_progress_bar.setValue(0)
+
+        self._doc_thread.start()
         
-        # --- Loading dialog ---
-        progress = QProgressDialog(
-            "Reading Word documents and counting pages...",
-            "",  # with no cancel button
-            0,
-            len(to_process),
-            self
-        )
-        progress.setWindowTitle("Please wait...")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-
-        try:
-            import pythoncom  # type: ignore
-            import win32com.client  # type: ignore
-        except Exception:
-            # pywin32 no disponible
-            return
-
-        try:
-            from snapmerge.services.docx_to_pdf import _patch_win32com_genpy_to_temp
-            try:
-                _patch_win32com_genpy_to_temp()
-            except Exception:
-                pass
-        except Exception:
-            # If the patch cannot be imported, we continue as before.
-            pass
-
-        word = None
-        co_init = False
-
-        # open wait cursor
-        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
-        
-        try:
-            pythoncom.CoInitialize()
-            co_init = True
-
-            word = win32com.client.DispatchEx("Word.Application")
-            word.Visible = False
-            word.DisplayAlerts = 0  # wdAlertsNone
-
-            for idx, doc_path in enumerate(to_process, start=1):
-                progress.setValue(idx) # update progress
-                QApplication.processEvents()
-                
-                try:
-                    doc = word.Documents.Open(
-                        str(doc_path),
-                        ReadOnly=True,
-                        ConfirmConversions=False,
-                    )
-                except Exception:
-                    continue
-
-                try:
-                    pages = None
-
-                    # Internal property "Number of Pages"
-                    try:
-                        props = doc.BuiltInDocumentProperties
-                        pages = int(props("Number of Pages"))
-                    except Exception:
-                        pages = None
-
-                    # Fallback: ComputeStatistics
-                    if pages is None:
-                        try:
-                            wdStatisticPages = 2  # pages
-                            pages = int(doc.ComputeStatistics(wdStatisticPages))
-                        except Exception:
-                            pages = None
-
-                    if pages is not None and pages > 0:
-                        self._doc_pages_cache[doc_path] = pages
-
-                finally:
-                    try:
-                        doc.Close(False)
-                    except Exception:
-                        pass
-            progress.close()
-        finally:
-            try:
-                if word is not None:
-                    word.Quit()
-            except Exception:
-                pass
-
-            if co_init:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-            # restore cursor
-            QGuiApplication.restoreOverrideCursor()
-
-        # With the cache now populated, we update the "Pages" column in the table
-        for row in range(self.table.rowCount()):
-            item_path = self.table.item(row, 5)  # Path
-            if item_path is None:
-                continue
-            p = Path((item_path.text() or "").strip()).resolve()
-            pages = self._doc_pages_cache.get(p)
-            if pages is None:
-                continue
-
-            pages_item = self.table.item(row, 4)
-            if pages_item is None:
-                pages_item = QTableWidgetItem()
-                pages_item.setTextAlignment(Qt.AlignCenter)
-                self.table.setItem(row, 4, pages_item)
-
-            pages_item.setText(str(pages))
-
-        # Recalculate the total at the end
-        self._recalculate_total_pages()
-
-    def _get_word_pages(self, path: Path) -> int | None:
-        """
-        Try to get the page count for a .doc/.docx file using Word/COM.
-
-        Returns:
-            int  -> number of pages if successful
-            None -> if not available (non-Windows, no Word, error, etc.)
-        """
-        # Cache by absolute path to avoid extra COM calls
-        abs_path = path.resolve()
-        if abs_path in self._doc_pages_cache:
-            return self._doc_pages_cache[abs_path]
-
-        # Only available on Windows
-        if sys.platform != "win32":
-            return None
-
-        try:
-            import pythoncom  # type: ignore
-            import win32com.client  # type: ignore
-        except Exception:
-            # pywin32 not installed
-            return None
-
-        # Use the same gen_py patch that you use in docx_to_pdf
-        try:
-            _patch_win32com_genpy_to_temp()
-        except Exception:
-            # If patch fails, we still try to continue
-            pass
-
-        word = None
-        co_init = False
-        try:
-            pythoncom.CoInitialize()
-            co_init = True
-
-            word = win32com.client.DispatchEx("Word.Application")
-            word.Visible = False
-            word.DisplayAlerts = 0  # wdAlertsNone
-
-            # Open without conversions prompts (handles .doc 97-2003, etc.)
-            doc = word.Documents.Open(str(abs_path), ReadOnly=True, ConfirmConversions=False)
-            try:
-                pages = None
-
-                # First try built-in document property "Number of Pages"
-                try:
-                    props = doc.BuiltInDocumentProperties
-                    pages = int(props("Number of Pages"))
-                except Exception:
-                    pages = None
-
-                # Fallback: ComputeStatistics(wdStatisticPages)
-                if pages is None:
-                    try:
-                        wdStatisticPages = 2  # constant for pages
-                        pages = int(doc.ComputeStatistics(wdStatisticPages))
-                    except Exception:
-                        pages = None
-
-            finally:
-                # Close Word document without saving
-                doc.Close(False)
-
-            if pages is not None and pages > 0:
-                self._doc_pages_cache[abs_path] = pages
-                return pages
-
-            return None
-
-        except Exception:
-            # Any COM error: we just don't show pages
-            return None
-
-        finally:
-            try:
-                if word is not None:
-                    word.Quit()
-            except Exception:
-                pass
-            if co_init:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
+    def _on_doc_thread_finished(self) -> None:
+        self._doc_thread = None
+        self._doc_worker = None
+        self.ui.merge_progress_bar.setVisible(False)
     
     def _recalculate_total_pages(self) -> None:
         """Recalculate and display the total number of pages from the table."""
@@ -843,6 +676,46 @@ class SnapMergeApp(QtBaseClass):
         """Reset thread/worker references when the QThread stops."""
         self._merge_thread = None
         self._merge_worker = None
+        
+    # --------------------- Doc Pages Worker Slots ---------------------
+    def _on_doc_pages_status(self, message: str) -> None:
+        self.log(message)
+
+    def _on_doc_pages_progress(self, done: int, total: int) -> None:
+        # Barra compartida mientras NO se esté ejecutando un merge
+        self.ui.merge_progress_bar.setMaximum(total)
+        self.ui.merge_progress_bar.setValue(done)
+
+    def _on_doc_pages_finished(self, pages_map: dict) -> None:
+        # Actualizar cache y tabla
+        for path_str, pages in pages_map.items():
+            p = Path(path_str)
+            self._doc_pages_cache[p] = pages
+
+        for row in range(self.table.rowCount()):
+            path_item = self.table.item(row, 5)
+            if path_item is None:
+                continue
+            row_path = Path(path_item.text()).resolve()
+            if row_path in self._doc_pages_cache:
+                pages = self._doc_pages_cache[row_path]
+                pages_item = self.table.item(row, 4)
+                if pages_item is None:
+                    pages_item = QTableWidgetItem()
+                    pages_item.setTextAlignment(Qt.AlignCenter)
+                    self.table.setItem(row, 4, pages_item)
+                pages_item.setText(str(pages))
+
+        self._recalculate_total_pages()
+        self.log(
+            f"Finished reading Word page counts for {len(pages_map)} document(s).",
+            "success",
+        )
+
+    def _on_doc_pages_error(self, message: str, tb: str) -> None:
+        self.log(f"Error reading Word pages: {message}", "error")
+        # opcional: escribir el traceback en el log o archivo
+
 
     # -------------------- Drag & Drop Events -------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
@@ -1126,9 +999,9 @@ class SnapMergeApp(QtBaseClass):
 
         self.log("Merge requested.")
         self.log(f"Destination: {output_path}")
-        self.log("Files to merge (in order):")
-        for p in paths:
-            self.log(f"  - {p}")
+        # self.log("Files to merge (in order):")
+        # for p in paths:
+        #     self.log(f"  - {p}")
 
         # Disable main UI while merging and show progress bar
         self._set_ui_enabled(False)
