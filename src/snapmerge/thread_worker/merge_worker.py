@@ -72,7 +72,6 @@ class MergeWorker(QObject):
         self._cancel_requested = False
 
     # --------------------------- internal callbacks -----------------------
-
     def _progress_cb(self, done: int, total: int) -> None:
         self._check_cancel()
         self.progress.emit(done, total)
