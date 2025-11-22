@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from snapmerge.config import Settings
-# from snapmerge.services.docx_to_pdf import _patch_win32com_genpy_to_temp
+from snapmerge.services.eml_to_pdf import estimate_eml_pages
 from snapmerge.thread_worker.doc_pages_worker import DocPagesWorker
 from snapmerge.thread_worker.merge_worker import MergeWorker, MergeJob
 
@@ -50,7 +50,7 @@ class SnapMergeApp(QtBaseClass):
         
         # Log styles
         self.LOG_STYLES = {
-            "warning": {"color": "#d97a00", "bold": True},
+            "warning": {"color": "#FE6244", "bold": True},
             "error":   {"color": "#c62828", "bold": True},
             "success": {"color": "#007200", "bold": True},
             "info":    {"color": "#000000", "bold": False},
@@ -63,6 +63,7 @@ class SnapMergeApp(QtBaseClass):
         # Progress bar initial state
         self.ui.merge_progress_bar.setValue(0)
         self.ui.merge_progress_bar.setVisible(False)
+        self.ui.merge_progress_bar.setRange(0, 100)
 
         # Enable drag & drop
         self.setAcceptDrops(True)
@@ -204,7 +205,6 @@ class SnapMergeApp(QtBaseClass):
         self.ui.run_btn.setEnabled(enabled)
 
     # -------------------- File list handling -------------------------
-
     def _collect_files_from_folder(self, folder: Path, recursive: bool) -> List[Path]:
         """Return the list of supported files in the folder (and subfolders if recursive=True)."""
         if recursive:
@@ -362,7 +362,7 @@ class SnapMergeApp(QtBaseClass):
             type_item = QTableWidgetItem(ext)
             self.table.setItem(row, 2, type_item)
 
-            # Column 3: Size (ya calculado)
+            # Column 3: Size
             size_item = QTableWidgetItem(size_str)
             size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table.setItem(row, 3, size_item)
@@ -397,6 +397,7 @@ class SnapMergeApp(QtBaseClass):
 
     @staticmethod
     def _format_size(num_bytes: int) -> str:
+        
         for unit in ["B", "KB", "MB", "GB"]:
             if num_bytes < 1024.0:
                 return f"{num_bytes:.0f} {unit}"
@@ -425,6 +426,12 @@ class SnapMergeApp(QtBaseClass):
                 return len(reader.pages)
             except Exception:
                 # If anything goes wrong, we just don't show pages
+                return None
+            
+        if ext == ".eml":
+            try:
+                return estimate_eml_pages(path)
+            except Exception:
                 return None
 
         # Docs: we never call word counter here
@@ -466,7 +473,7 @@ class SnapMergeApp(QtBaseClass):
         #     return
 
         self._start_doc_pages_job(to_process)
-        
+            
     def _start_doc_pages_job(self, paths: list[Path]) -> None:
         # Avoid launching two page workers in parallel.
         if self._doc_thread is not None and self._doc_thread.isRunning():
@@ -486,6 +493,8 @@ class SnapMergeApp(QtBaseClass):
         self._doc_worker.progress.connect(self._on_doc_pages_progress)
         self._doc_worker.finished.connect(self._on_doc_pages_finished)
         self._doc_worker.error.connect(self._on_doc_pages_error)
+        self._doc_worker.error.connect(self._doc_thread.quit)
+        self._doc_worker.error.connect(self._doc_worker.deleteLater)
 
         # Cleaning
         self._doc_worker.finished.connect(self._doc_thread.quit)
@@ -502,6 +511,10 @@ class SnapMergeApp(QtBaseClass):
     def _on_doc_thread_finished(self) -> None:
         self._doc_thread = None
         self._doc_worker = None
+        
+        # Reset the bar for future merges
+        self.ui.merge_progress_bar.setRange(0, 100)
+        self.ui.merge_progress_bar.setValue(0)
         self.ui.merge_progress_bar.setVisible(False)
     
     def _recalculate_total_pages(self) -> None:
@@ -682,8 +695,8 @@ class SnapMergeApp(QtBaseClass):
         self.log(message)
 
     def _on_doc_pages_progress(self, done: int, total: int) -> None:
-        # Barra compartida mientras NO se esté ejecutando un merge
-        self.ui.merge_progress_bar.setMaximum(total)
+        # Shared toolbar while NOT performing a merge
+        self.ui.merge_progress_bar.setRange(0, total)
         self.ui.merge_progress_bar.setValue(done)
 
     def _on_doc_pages_finished(self, pages_map: dict) -> None:
@@ -714,8 +727,14 @@ class SnapMergeApp(QtBaseClass):
 
     def _on_doc_pages_error(self, message: str, tb: str) -> None:
         self.log(f"Error reading Word pages: {message}", "error")
-        # opcional: escribir el traceback en el log o archivo
+            
+        if tb:
+            self.log(tb, "error")
 
+        # Reset visual state after error
+        self.ui.merge_progress_bar.setRange(0, 100)
+        self.ui.merge_progress_bar.setValue(0)
+        self.ui.merge_progress_bar.setVisible(False)
 
     # -------------------- Drag & Drop Events -------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
@@ -804,21 +823,31 @@ class SnapMergeApp(QtBaseClass):
 
         event.acceptProposedAction()
 
-    # -------------------- Slots: toolbar buttons ---------------------
-
+    # -------------------- Slots: toolbar buttons ---------------------    
     def on_add_files(self) -> None:
         """Select one or more files and append them to the list."""
         start_dir = str(Path.home())
+
+        exts = sorted(self.settings.allowed_exts)  
+        exts = [f"*{ext}" for ext in exts]    
+        ext_string = " ".join(exts)
+
         filters = (
-            "Supported files (*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.docx);;"
+            f"Supported files ({ext_string});;"
+            f"Images ({' '.join('*' + e for e in self.settings._data['allowed_images'])});;"
+            f"Documents ({' '.join('*' + e for e in self.settings._data['allowed_docs'])});;"
+            f"Emails ({' '.join('*' + e for e in self.settings._data['allowed_emails'])});;"
+            f"PDFs (*.pdf);;"
             "All files (*.*)"
         )
+
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select files to merge",
             start_dir,
             filters,
         )
+
         paths = [Path(f) for f in files]
         if paths:
             self._append_files(paths)
@@ -1005,8 +1034,9 @@ class SnapMergeApp(QtBaseClass):
 
         # Disable main UI while merging and show progress bar
         self._set_ui_enabled(False)
-        self.ui.merge_progress_bar.setVisible(True)
+        self.ui.merge_progress_bar.setRange(0, 100)  # <- importante
         self.ui.merge_progress_bar.setValue(0)
+        self.ui.merge_progress_bar.setVisible(True)
 
         # Stage files into a temporary folder so that the pipeline can
         # work over a single input_dir while preserving the table order.

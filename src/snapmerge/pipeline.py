@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Iterable
 
+from snapmerge.services.eml_to_pdf import eml_to_pdf
 from snapmerge.services.file_names import get_original_file_name
 from .config import Settings
 from .logging_setup import get_logger
@@ -30,6 +31,7 @@ def run_merge(
         (settings.get("allowed_pdfs") or [])
         + (settings.get("allowed_images") or [])
         + (settings.get("allowed_docs") or [])
+        + (settings.get("allowed_emails") or [])
     )
 
     files = list(discover_files(job.input_dir, job.include_subfolders))
@@ -68,6 +70,7 @@ def _run_core_from_files(
     allowed_pdfs = settings.get("allowed_pdfs") or []
     allowed_images = settings.get("allowed_images") or []
     allowed_docs = settings.get("allowed_docs") or []
+    allowed_emails = settings.get("allowed_emails") or []
 
     to_merge: list[Path] = []
     skipped: list[Path] = []
@@ -111,6 +114,14 @@ def _run_core_from_files(
                             status_cb(f"Can't Convert {original_name} to PDF")
                         logger.warning("Word not available or output missing. Skipping %s", f)
                         skipped.append(f)
+                
+                elif ext in allowed_emails:
+                    outp = tmp.path / (f.stem + ".eml")
+                    if status_cb:
+                        status_cb(f"Converting Email → EML: {original_name}")
+                    eml_to_pdf(f, outp)
+                    converted.append(outp)
+                    to_merge.append(outp)
                 else:
                     skipped.append(f)
 
