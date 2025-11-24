@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 
 from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QCloseEvent
 from PySide6.QtUiTools import loadUiType
 from PySide6.QtWidgets import (
     QApplication,
@@ -692,28 +692,38 @@ class SnapMergeApp(QtBaseClass):
         self._merge_thread.finished.connect(self._merge_thread.deleteLater)
 
         self._merge_thread.start()
-
+            
     def _cleanup_staging_dir(self) -> None:
-        """Delete the temporary staging directory, if any."""
+        """Delete internal staging dir and, optionally, temp work."""
+        # 1) Pipeline staging is ALWAYS removed
         if self._current_staging_dir is not None:
             try:
                 shutil.rmtree(self._current_staging_dir, ignore_errors=True)
             except Exception:
-                # Best‑effort clean‑up; don't crash the app on failure
+                # Best-effort clean-up; don't crash the app on failure
                 pass
             finally:
                 self._current_staging_dir = None
-                        
-        # Also clean the tempdirs from .zip extraction
-        if getattr(self, "_zip_temp_dirs", None) and self.ui.clean_work_chk.isChecked():
-            for d in self._zip_temp_dirs:
-                try:
-                    shutil.rmtree(d, ignore_errors=True)
-                except Exception:
-                    pass
-            self._zip_temp_dirs.clear()
+
+        # 2) If the user wants "Clean Work", we clean EVERYTHING
+        if self.ui.clean_work_chk.isChecked():
+            # Delete the tempdirs from the .zip file (if any)
+            if getattr(self, "_zip_temp_dirs", None):
+                for d in self._zip_temp_dirs:
+                    try:
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
+                self._zip_temp_dirs.clear()
+
             self.on_clear_all()
             self.log("Ready to merge again", "info")
+        else:
+            # Clean Work unchecked:
+            # - We do NOT touch self._zip_temp_dirs
+            # - We do NOT clean the table
+            # The user can continue using those files extracted from the .zip
+            pass
 
     # -- slots that receive progress from MergeWorker (GUI thread) -----
 
@@ -856,7 +866,7 @@ class SnapMergeApp(QtBaseClass):
         self.ui.merge_progress_bar.setValue(0)
         self.ui.merge_progress_bar.setVisible(False)
 
-    # -------------------- Drag & Drop Events -------------------------
+    # -------------------- Drag & Drop, Close Events -------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
         """Trigger when something enters the window with drag."""
         mime = event.mimeData()
@@ -942,6 +952,25 @@ class SnapMergeApp(QtBaseClass):
                 self.log(f" - {r.name}  →  {r}")
 
         event.acceptProposedAction()
+        
+    def closeEvent(self, event: QCloseEvent) -> None:
+        # Clean up staging in case there's anything pending
+        if self._current_staging_dir is not None:
+            try:
+                shutil.rmtree(self._current_staging_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        # ALWAYS clean the .zip file's temperature settings upon exiting, without relying on Clean Work.
+        if getattr(self, "_zip_temp_dirs", None):
+            for d in self._zip_temp_dirs:
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+            self._zip_temp_dirs.clear()
+
+        super().closeEvent(event)
 
     # -------------------- Slots: toolbar buttons ---------------------    
     def on_add_files(self) -> None:
