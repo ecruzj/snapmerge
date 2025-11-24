@@ -197,6 +197,7 @@ class SnapMergeApp(QtBaseClass):
         self.ui.sort_name_btn.setEnabled(enabled)
         self.ui.sort_type_btn.setEnabled(enabled)
         self.ui.allow_duplicate_files_chk.setEnabled(enabled)
+        self.ui.clean_work_chk.setEnabled(enabled)
 
         # Table
         self.table.setEnabled(enabled)
@@ -702,15 +703,17 @@ class SnapMergeApp(QtBaseClass):
                 pass
             finally:
                 self._current_staging_dir = None
-                
-        # # Also clean the tempdirs from .zip extraction
-        # if getattr(self, "_zip_temp_dirs", None):
-        #     for d in self._zip_temp_dirs:
-        #         try:
-        #             shutil.rmtree(d, ignore_errors=True)
-        #         except Exception:
-        #             pass
-        #     self._zip_temp_dirs.clear()
+                        
+        # Also clean the tempdirs from .zip extraction
+        if getattr(self, "_zip_temp_dirs", None) and self.ui.clean_work_chk.isChecked():
+            for d in self._zip_temp_dirs:
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+            self._zip_temp_dirs.clear()
+            self.on_clear_all()
+            self.log("Ready to merge again", "info")
 
     # -- slots that receive progress from MergeWorker (GUI thread) -----
 
