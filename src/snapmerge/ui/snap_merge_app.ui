@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>799</width>
+    <width>940</width>
     <height>581</height>
    </rect>
   </property>
@@ -42,6 +42,16 @@
        <widget class="QCheckBox" name="allow_duplicate_files_chk">
         <property name="text">
          <string>Allow Duplicate Files</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="clean_work_chk">
+        <property name="text">
+         <string>Clean Work</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
         </property>
        </widget>
       </item>
@@ -257,7 +267,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>799</width>
+     <width>940</width>
      <height>33</height>
     </rect>
    </property>
