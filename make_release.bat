@@ -36,7 +36,7 @@ REM --- build ---
 pyinstaller --noconfirm --onefile --windowed --name SnapMerge --version-file "%VER%" ^
   --icon "src\snapmerge\ui\icon.ico" ^
   --add-data "config.yaml;." ^
-  --add-data "src\snapmerge\ui\SnapMerge.ui;snapmerge/ui" ^
+  --add-data "src\snapmerge\ui\snap_merge_app.ui;snapmerge/ui" ^
   --add-data "src\snapmerge\ui\icon.ico;snapmerge/ui" ^
   --collect-all Crypto ^
   -p src main.py

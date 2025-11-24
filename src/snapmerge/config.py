@@ -13,6 +13,7 @@ DEFAULTS = {
     "allowed_docs": [".docx", ".doc", ".odt", ".rtf"],
     "allowed_pdfs": [".pdf"],
     "allowed_emails": [".eml"],
+    "allowed_zip": [".zip"],
     "max_image_dim_px": 4000,
     "workers": 4,
     "word_page_count": True
@@ -30,6 +31,7 @@ class Settings:
             + self._data["allowed_docs"]
             + self._data["allowed_pdfs"]
             + self._data["allowed_emails"]
+            + self._data["allowed_zip"]
         )
 
     @classmethod
