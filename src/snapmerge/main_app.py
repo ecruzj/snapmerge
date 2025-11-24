@@ -3,6 +3,7 @@ import html
 import shutil
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import List
 
@@ -143,6 +144,7 @@ class SnapMergeApp(QtBaseClass):
         self.image_exts = {ext.lower() for ext in self.settings.get("allowed_images", [])}
         self.pdf_exts = {ext.lower() for ext in self.settings.get("allowed_pdfs", [])}
         self.doc_exts = {ext.lower() for ext in self.settings.get("allowed_docs", [])}
+        self.zip_exts = {ext.lower() for ext in self.settings.get("allowed_zip", [])}
         
         self.word_page_count_enabled = bool(self.settings.get("word_page_count", True))
         self.max_docs_for_word_batch = int(self.settings.get("max_docs_for_word_batch", 30))
@@ -156,6 +158,9 @@ class SnapMergeApp(QtBaseClass):
         self._last_output_pdf: Path | None = None
         self._doc_thread: QThread | None = None
         self._doc_worker: DocPagesWorker | None = None
+        
+        # Temporary folders used to extract content from .zip files
+        self._zip_temp_dirs: list[Path] = []
 
     # ------------------------------------------------------------------
     # Helpers
@@ -217,6 +222,92 @@ class SnapMergeApp(QtBaseClass):
         ]
         return paths
     
+    def _collect_files_from_zip(self, zip_path: Path) -> List[Path]:
+        """
+        Extracts all files from a .zip archive whose suffix is ​​specified 
+        in self.settings.allowed_exts and returns the extracted paths.
+
+        The files are extracted to a temporary directory, which will be stored 
+        in self._zip_temp_dirs so it can be cleaned up later.
+        """
+        extracted: List[Path] = []
+
+        if not zip_path.is_file():
+            return extracted
+
+        try:
+            zf = zipfile.ZipFile(zip_path, "r")
+        except Exception as exc:
+            self.log(f"Could not open zip file: {zip_path} ({exc})", "error")
+            return extracted
+
+        # Create a dedicated tempdir for this zip
+        extract_root = Path(
+            tempfile.mkdtemp(prefix=f"snapmerge_zip_{zip_path.stem}_")
+        )
+        self._zip_temp_dirs.append(extract_root)
+
+        try:
+            for idx, info in enumerate(zf.infolist(), start=1):
+                # Skip directories
+                if info.is_dir():
+                    continue
+
+                inner_name = info.filename
+                inner_path = Path(inner_name)
+
+                ext = inner_path.suffix.lower()
+                if ext not in self.settings.allowed_exts:
+                    # Ignore files with unsupported extensions
+                    continue
+
+                # Safe original name (without subfolders)
+                safe_name = inner_path.name
+                dest = extract_root / safe_name
+
+                # If a file with that name already exists in this tempdir,
+                # we treat it as a duplicate within the ZIP and skip it.
+                if dest.exists():
+                    try:
+                        # compare sizes and log something more precise
+                        self.log(
+                            f"Skipped duplicate entry inside zip: {inner_name}",
+                            "warning",
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                try:
+                    with zf.open(info, "r") as src, open(dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    extracted.append(dest)
+                except Exception as exc:
+                    self.log(
+                        f"Error extracting {inner_name} from {zip_path}: {exc}",
+                        "error",
+                    )
+                    continue
+
+        finally:
+            try:
+                zf.close()
+            except Exception:
+                pass
+
+        if extracted:
+            self.log(
+                f"Extracted {len(extracted)} file(s) from zip: {zip_path}",
+                "info",
+            )
+        else:
+            self.log(
+                f"No supported files found inside zip: {zip_path}",
+                "warning",
+            )
+
+        return extracted
+    
     def _append_files(self, paths: List[Path]) -> None:
         """
         Append the given file paths to the table, skipping duplicates.
@@ -227,6 +318,23 @@ class SnapMergeApp(QtBaseClass):
         - Same signature (Name, Type, Size) only for .doc/.docx (ignoring Pages).
         """
         if not paths:
+            return
+        
+        # ------------------------------------------------------------------
+        # Expand .zip files into their contents
+        # ------------------------------------------------------------------
+        expanded_paths: List[Path] = []
+        for p in paths:
+            if p.is_file() and p.suffix.lower() == ".zip":
+                # Treat .zip as a "virtual folder"
+                inner_files = self._collect_files_from_zip(p)
+                expanded_paths.extend(inner_files)
+            else:
+                expanded_paths.append(p)
+
+        paths = expanded_paths
+        if not paths:
+            # If there was only a .zip file with no supported files inside
             return
         
         # If the user checked "Overwrite if exists", we allow duplicates
@@ -594,6 +702,15 @@ class SnapMergeApp(QtBaseClass):
                 pass
             finally:
                 self._current_staging_dir = None
+                
+        # # Also clean the tempdirs from .zip extraction
+        # if getattr(self, "_zip_temp_dirs", None):
+        #     for d in self._zip_temp_dirs:
+        #         try:
+        #             shutil.rmtree(d, ignore_errors=True)
+        #         except Exception:
+        #             pass
+        #     self._zip_temp_dirs.clear()
 
     # -- slots that receive progress from MergeWorker (GUI thread) -----
 
@@ -837,6 +954,7 @@ class SnapMergeApp(QtBaseClass):
             f"Images ({' '.join('*' + e for e in self.settings._data['allowed_images'])});;"
             f"Documents ({' '.join('*' + e for e in self.settings._data['allowed_docs'])});;"
             f"Emails ({' '.join('*' + e for e in self.settings._data['allowed_emails'])});;"
+            f"Archives ({' '.join('*' + e for e in self.settings._data['allowed_zip'])});;"
             f"PDFs (*.pdf);;"
             "All files (*.*)"
         )

@@ -6,6 +6,7 @@ allowed_images: [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"]
 allowed_docs: [".docx", ".doc", ".odt", ".rtf"]
 allowed_pdfs: [".pdf"]
 allowed_emails: [".eml"]
+allowed_zip: [".zip"]
 max_image_dim_px: 4000 # downscale if either width/height exceeds this
 workers: 4
 word_page_count: true
