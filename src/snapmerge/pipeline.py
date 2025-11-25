@@ -23,7 +23,7 @@ def run_merge(
     merge_progress_cb: Callable[[int, int], None] | None = None,
     log_file: Path | None = None,
 ) -> dict:
-    """Run the end-to-end job from a folder (modo clásico)."""
+    """Run the end-to-end job from a folder (clasic mode)."""
     logger = get_logger(logfile=log_file)
     job: JobSettings = settings.as_job(input_dir, output_pdf)
 

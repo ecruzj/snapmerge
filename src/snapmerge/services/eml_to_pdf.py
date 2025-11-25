@@ -47,14 +47,14 @@ def _html_to_text(html: str) -> str:
     # Remove script and style blocks
     text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", text)
 
-    # <br> y </p> -> saltos de línea
+    # <br> y </p> -> line breaks
     text = re.sub(r"(?i)<\s*br\s*/?>", "\n", text)
     text = re.sub(r"(?i)</p>", "\n\n", text)
 
-    # Quitar el resto de etiquetas
+    # Remove the remaining tags
     text = re.sub(r"(?s)<[^>]+>", "", text)
 
-    # Normalizar saltos de línea
+    # Normalize line breaks
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
 
@@ -70,12 +70,12 @@ def _extract_best_body(msg) -> str:
       2) text/html convertido a texto
     """
     if msg.is_multipart():
-        # Primero text/plain
+        # First text/plain
         for part in msg.walk():
             if part.get_content_type() == "text/plain":
                 return _decode_part(part)
 
-        # Luego text/html
+        # Then text/html
         for part in msg.walk():
             if part.get_content_type() == "text/html":
                 raw = _decode_part(part)
@@ -108,14 +108,14 @@ def _build_header_block(msg) -> str:
         headers.append(cc_line)
     headers.append(_format_header_line("Subject", msg.get("Subject")))
 
-    # Eliminar líneas vacías
+    # Remove empty lines
     headers = [h for h in headers if h]
 
     if not headers:
         return ""
 
     block = "\n".join(headers)
-    # Regla horizontal tipo Outlook
+    # Outlook-style horizontal ruler
     block += "\n" + ("-" * 72) + "\n"
     return block
 
@@ -131,8 +131,8 @@ def _wrap_text_lines(
     font_size: int,
 ) -> List[str]:
     """
-    Envuelve el texto en múltiples líneas para que cada una quepa en max_width.
-    Usa stringWidth de ReportLab para medir la longitud real.
+    Wrap the text across multiple lines so that each one fits within max_width.
+    Use ReportLab's stringWidth to measure the actual length.
     """
     lines: List[str] = []
     for raw_line in text.splitlines():
@@ -156,7 +156,6 @@ def _wrap_text_lines(
 
     return lines
 
-
 def _draw_text_multi_page(
     c: canvas.Canvas,
     text: str,
@@ -172,7 +171,7 @@ def _draw_text_multi_page(
     """
     Dibuja texto en varias páginas con un layout sencillo tipo Outlook.
 
-    Devuelve el número de páginas usadas.
+    Returns the number of pages used.
     """
     page_width, _page_height = letter
     usable_width = page_width - left_margin - right_margin
@@ -197,13 +196,13 @@ def _draw_text_multi_page(
     return pages
 
 def _build_final_text_for_eml(path: Path) -> str:
-    """Reutiliza la misma lógica de header + body que eml_to_pdf."""
+    """It reuses the same header + body logic as eml_to_pdf."""
     msg = _load_email(path)
 
     header_block = _build_header_block(msg)
     body_text = _extract_best_body(msg)
 
-    # Normalizar saltos
+    # Normalize jumps
     body_text = (body_text or "").replace("\r\n", "\n").replace("\r", "\n")
 
     if header_block and body_text:
@@ -227,7 +226,7 @@ def eml_to_pdf(input_eml: Path, output_pdf: Path) -> EmlToPdfResult:
 
     c = canvas.Canvas(str(output_pdf), pagesize=letter)
 
-    # Exactamente el mismo layout
+    # Exactly the same layout
     pages_used = _draw_text_multi_page(c, final_text)
     c.save()
 
@@ -237,49 +236,10 @@ def eml_to_pdf(input_eml: Path, output_pdf: Path) -> EmlToPdfResult:
         pages=pages_used,
     )
 
-# def eml_to_pdf(input_eml: Path, output_pdf: Path) -> EmlToPdfResult:
-#     """
-#     Convert an .eml file into a reasonably Outlook-like PDF.
-
-#     Layout:
-#       * Bloque de encabezado (From/Sent/To/Cc/Subject) + línea horizontal
-#       * Body del correo en texto, preservando párrafos y quoting básico
-
-#     Attachments NO se renderizan (solo el cuerpo del correo).
-#     """
-#     input_eml = input_eml.resolve()
-#     output_pdf = output_pdf.resolve()
-
-#     msg = _load_email(input_eml)
-
-#     header_block = _build_header_block(msg)
-#     body_text = _extract_best_body(msg)
-
-#     # Normalizar saltos
-#     body_text = body_text.replace("\r\n", "\n").replace("\r", "\n")
-
-#     if header_block and body_text:
-#         final_text = header_block + "\n" + body_text
-#     elif header_block:
-#         final_text = header_block
-#     else:
-#         final_text = body_text or "(empty email)"
-
-#     # Crear PDF
-#     c = canvas.Canvas(str(output_pdf), pagesize=letter)
-#     pages_used = _draw_text_multi_page(c, final_text)
-#     c.save()
-
-#     return EmlToPdfResult(
-#         input_eml=input_eml,
-#         output_pdf=output_pdf,
-#         pages=pages_used,
-#     )
-
 def estimate_eml_pages(eml_path: Path) -> int | None:
     """
-    Estima el número de páginas que tendrá el E-mail en PDF,
-    usando el mismo layout que eml_to_pdf, pero sin generar el PDF.
+    Estimate the number of pages the email will have in PDF format,
+    using the same layout as eml_to_pdf, but without generating the PDF.
     """
     final_text = _build_final_text_for_eml(eml_path)
 
@@ -290,17 +250,17 @@ def estimate_eml_pages(eml_path: Path) -> int | None:
     bottom_margin = 1.0 * inch
     font_name = "Helvetica"
     font_size = 10
-    leading = 13  # espacio entre líneas
+    leading = 13  # space between lines
 
     usable_width = page_width - left_margin - right_margin
 
-    # Reutilizamos tu wrap
+    # We reuse your wrap
     lines = _wrap_text_lines(final_text, usable_width, font_name, font_size)
 
     if not lines:
         return 1
 
-    # Cuántas líneas caben en una página
+    # How many lines fit on a page
     available_height = top_margin - bottom_margin
     lines_per_page = max(1, int(available_height / leading))
 
