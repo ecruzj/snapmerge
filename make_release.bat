@@ -34,11 +34,17 @@ if not exist "%VER%"  echo [ERROR] Missing %VER% & exit /b 1
 
 REM --- build ---
 pyinstaller --noconfirm --onefile --windowed --name SnapMerge --version-file "%VER%" ^
-  --icon "src\snapmerge\ui\icon.ico" ^
+  --icon "src\snapmerge\ui\sm-icon.ico" ^
   --add-data "config.yaml;." ^
-  --add-data "src\snapmerge\ui\snap_merge_app.ui;snapmerge/ui" ^
-  --add-data "src\snapmerge\ui\icon.ico;snapmerge/ui" ^
+  --add-data "src\snapmerge\ui\sm-icon.ico;snapmerge/ui" ^
   --collect-all Crypto ^
+  --hidden-import PySide6 ^
+  --hidden-import PySide6.QtWidgets ^
+  --hidden-import PySide6.QtGui ^
+  --hidden-import PySide6.QtCore ^
+  --hidden-import shiboken6 ^
+  --exclude-module PyQt5 ^
+  --exclude-module PyQt6 ^
   -p src main.py
 
 echo.

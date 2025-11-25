@@ -24,24 +24,40 @@ from snapmerge.config import Settings
 from snapmerge.services.eml_to_pdf import estimate_eml_pages
 from snapmerge.thread_worker.doc_pages_worker import DocPagesWorker
 from snapmerge.thread_worker.merge_worker import MergeWorker, MergeJob
+from snapmerge.ui.snap_merge_app_ui import Ui_SnapMergeWindow
 
 # ---------------------------------------------------------------------------
-# Load .ui file
+# Load .ui file using .ui file
 # ---------------------------------------------------------------------------
+
+# def _resource_root() -> Path:
+#     """
+#     Returns the root folder where the resources are located (.ui, config, etc.).
+#     - In normal mode: folder of this file (snapmerge/)
+#     - In PyInstaller mode (onefile): folder extracted to sys._MEIPASS.
+#     """
+#     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+#         return Path(sys._MEIPASS) / "snapmerge"
+#     # Normal development/execution mode
+#     return Path(__file__).resolve().parent
 
 HERE = Path(__file__).resolve().parent
-UI_PATH = HERE / "ui" / "snap_merge_app.ui"
+# HERE = _resource_root() #Path(__file__).resolve().parent
+# UI_PATH = HERE / "ui" / "snap_merge_app.ui"
 
-if not UI_PATH.exists():
-    raise FileNotFoundError(f"UI file not found: {UI_PATH}")
+# if not UI_PATH.exists():
+#     raise FileNotFoundError(f"UI file not found: {UI_PATH}")
 
-_ui_result = loadUiType(str(UI_PATH))
-if isinstance(_ui_result, tuple):
-    Ui_SnapMergeWindow, QtBaseClass = _ui_result
-else:  # very old / edge Qt versions
-    Ui_SnapMergeWindow = _ui_result
-    QtBaseClass = QMainWindow
+# _ui_result = loadUiType(str(UI_PATH))
+# if not _ui_result:
+#     raise RuntimeError(f"Could not load UI from {UI_PATH}")
 
+# if isinstance(_ui_result, tuple):
+#     Ui_SnapMergeWindow, QtBaseClass = _ui_result
+# else:
+#     Ui_SnapMergeWindow = _ui_result
+QtBaseClass = QMainWindow
+    
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -71,7 +87,7 @@ class SnapMergeApp(QtBaseClass):
 
         # Optional: custom window title + icon
         self.setWindowTitle("SnapMerge - Merge files into PDF")
-        icon_path = HERE / "ui" / "icon.ico"
+        icon_path = HERE / "ui" / "sm-icon.ico"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
